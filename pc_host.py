@@ -4,19 +4,25 @@ import io
 import json
 import os
 import random
+import shutil
 import string
+import subprocess
+import sys
 import threading
 import tkinter as tk
 from tkinter import messagebox
 import mss
 import pyautogui
+import pyperclip
 import websockets
-from PIL import Image
+from PIL import Image, ImageDraw
 
 RELAY_URL = "wss://remote-relay-server-v5am.onrender.com"
 CONFIG_FILE = "remote_config.json"
 
 pyautogui.FAILSAFE = False
+SCREEN_QUALITY = 55
+SCREEN_WIDTH = 1280
 
 def load_or_create_config():
     if os.path.exists(CONFIG_FILE):
@@ -39,25 +45,62 @@ HOST_ID = config["id"]
 HOST_PASSWORD = config["password"]
 reconnect_flag = False
 
+# Windows ஆன் ஆகும்போது தானாகவே இயங்கச் செய்யும் வசதி
+def enable_autostart():
+    try:
+        startup_folder = os.path.join(
+            os.getenv("APPDATA"),
+            r"Microsoft\Windows\Start Menu\Programs\Startup"
+        )
+        exe_path = sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(__file__)
+        bat_path = os.path.join(startup_folder, "MyAnyDesk_AutoStart.bat")
+        with open(bat_path, "w") as f:
+            f.write(f'@echo off\ncd /d "{os.path.dirname(exe_path)}"\nstart "" "{exe_path}"\n')
+        return True
+    except Exception:
+        return False
+
 def capture_screen():
+    global SCREEN_QUALITY, SCREEN_WIDTH
     with mss.mss() as sct:
         monitor = sct.monitors[1]
         sct_img = sct.grab(monitor)
         img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
-        img.thumbnail((1280, 720))
+
+        # மவுஸ் கர்சர் இருக்கும் இடத்தைத் திரையில் தெளிவாக வரைதல்
+        try:
+            mx, my = pyautogui.position()
+            rel_x = mx - monitor["left"]
+            rel_y = my - monitor["top"]
+            draw = ImageDraw.Draw(img)
+            draw.ellipse((rel_x - 14, rel_y - 14, rel_x + 14, rel_y + 14), outline="red", width=3)
+            pointer = [
+                (rel_x, rel_y),
+                (rel_x, rel_y + 24),
+                (rel_x + 6, rel_y + 18),
+                (rel_x + 16, rel_y + 18),
+            ]
+            draw.polygon(pointer, fill="white", outline="black")
+        except Exception:
+            pass
+
+        ratio = SCREEN_WIDTH / float(img.size[0])
+        new_height = int(float(img.size[1]) * ratio)
+        img = img.resize((SCREEN_WIDTH, new_height), Image.Resampling.LANCZOS)
+
         buffer = io.BytesIO()
-        img.save(buffer, format="JPEG", quality=45)
+        img.save(buffer, format="JPEG", quality=SCREEN_QUALITY)
         return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
 async def connect_to_relay():
-    global reconnect_flag
+    global reconnect_flag, SCREEN_QUALITY, SCREEN_WIDTH
     screen_w, screen_h = pyautogui.size()
 
     while True:
         reconnect_flag = False
         uri = f"{RELAY_URL}/ws/host/{HOST_ID}/{HOST_PASSWORD}"
         try:
-            async with websockets.connect(uri) as ws:
+            async with websockets.connect(uri, max_size=20 * 1024 * 1024) as ws:
                 async def send_frames():
                     while not reconnect_flag:
                         img_data = capture_screen()
@@ -65,26 +108,72 @@ async def connect_to_relay():
                         await asyncio.sleep(0.08)
 
                 async def receive_commands():
+                    global SCREEN_QUALITY, SCREEN_WIDTH
                     async for message in ws:
                         if reconnect_flag:
                             break
                         cmd = json.loads(message)
                         action = cmd.get("type")
-                        if action in ["click", "right_click", "double_click"]:
+
+                        if action == "move":
                             x = int(cmd["x"] * screen_w)
                             y = int(cmd["y"] * screen_h)
+                            pyautogui.moveTo(x, y)
+
+                        elif action in ["click", "right_click", "double_click"]:
+                            if "x" in cmd and "y" in cmd:
+                                pyautogui.moveTo(int(cmd["x"] * screen_w), int(cmd["y"] * screen_h))
                             if action == "click":
-                                pyautogui.click(x, y)
+                                pyautogui.click()
                             elif action == "right_click":
-                                pyautogui.rightClick(x, y)
+                                pyautogui.rightClick()
                             elif action == "double_click":
-                                pyautogui.doubleClick(x, y)
+                                pyautogui.doubleClick()
+
+                        elif action == "mouse_down":
+                            pyautogui.mouseDown()
+                        elif action == "mouse_up":
+                            pyautogui.mouseUp()
+
                         elif action == "scroll":
                             pyautogui.scroll(cmd["amount"])
+
                         elif action == "type":
                             pyautogui.write(cmd["text"])
+
+                        elif action == "paste_text":
+                            pyperclip.copy(cmd["text"])
+                            pyautogui.hotkey("ctrl", "v")
+
                         elif action == "key":
                             pyautogui.press(cmd["key"])
+
+                        elif action == "hotkey":
+                            keys = cmd["keys"]
+                            pyautogui.hotkey(*keys)
+
+                        elif action == "quality":
+                            level = cmd["level"]
+                            if level == "low":
+                                SCREEN_WIDTH, SCREEN_QUALITY = 854, 30
+                            elif level == "medium":
+                                SCREEN_WIDTH, SCREEN_QUALITY = 1280, 55
+                            elif level == "hd":
+                                SCREEN_WIDTH, SCREEN_QUALITY = 1600, 80
+
+                        elif action == "file_upload":
+                            save_dir = os.path.join(os.path.expanduser("~"), "Desktop", "Remote_Received")
+                            os.makedirs(save_dir, exist_ok=True)
+                            file_path = os.path.join(save_dir, cmd["filename"])
+                            with open(file_path, "wb") as f:
+                                f.write(base64.b64decode(cmd["data"]))
+
+                        elif action == "power":
+                            mode = cmd["mode"]
+                            if mode == "restart":
+                                subprocess.Popen("shutdown /r /t 5", shell=True)
+                            elif mode == "shutdown":
+                                subprocess.Popen("shutdown /s /t 5", shell=True)
 
                 await asyncio.gather(send_frames(), receive_commands())
         except Exception:
@@ -95,20 +184,20 @@ def start_async_loop():
 
 def start_gui():
     root = tk.Tk()
-    root.title("My Remote PC Host")
-    root.geometry("360x260")
+    root.title("My AnyDesk Pro - PC Host")
+    root.geometry("380x320")
     root.resizable(False, False)
 
     formatted_id = f"{HOST_ID[:3]} {HOST_ID[3:6]} {HOST_ID[6:]}"
 
-    tk.Label(root, text="உங்கள் கணினி இணையத்துடன் இணைக்கப்பட்டுள்ளது", font=("Arial", 10, "bold"), fg="green").pack(pady=10)
+    tk.Label(root, text="● இணையத்துடன் இணைக்கப்பட்டுள்ளது (Online)", font=("Arial", 10, "bold"), fg="green").pack(pady=10)
     tk.Label(root, text="Your Permanent ID (நிரந்தர எண்):", font=("Arial", 10)).pack()
-    tk.Label(root, text=formatted_id, font=("Arial", 18, "bold"), fg="#0052cc").pack(pady=2)
+    tk.Label(root, text=formatted_id, font=("Arial", 20, "bold"), fg="#0052cc").pack(pady=2)
 
-    tk.Label(root, text="Set Your Password (கடவுச்சொல் அமைக்கவும்):", font=("Arial", 10)).pack(pady=(10, 2))
-    pass_entry = tk.Entry(root, font=("Arial", 12), justify="center", width=20)
+    tk.Label(root, text="Set Permanent Password (கடவுச்சொல்):", font=("Arial", 10)).pack(pady=(8, 2))
+    pass_entry = tk.Entry(root, font=("Arial", 12), justify="center", width=22)
     pass_entry.insert(0, HOST_PASSWORD)
-    pass_entry.pack(pady=5)
+    pass_entry.pack(pady=4)
 
     def update_password():
         global HOST_PASSWORD, reconnect_flag
@@ -121,11 +210,18 @@ def start_gui():
         reconnect_flag = True
         messagebox.showinfo("வெற்றி", "புதிய பாஸ்வேர்டு சேமிக்கப்பட்டது!")
 
-    tk.Button(root, text="Save Password (சேமிக்கவும்)", command=update_password, bg="#0052cc", fg="white", font=("Arial", 10, "bold")).pack(pady=10)
+    def setup_boot():
+        if enable_autostart():
+            messagebox.showinfo("வெற்றி", "இனி கம்ப்யூட்டர் ஆன் ஆனவுடன் இந்த செயலி தானாகவே இயங்கும்!")
+        else:
+            messagebox.showerror("பிழை", "Auto-Start அமைக்க முடியவில்லை.")
+
+    tk.Button(root, text="Save Password (சேமிக்கவும்)", command=update_password, bg="#0052cc", fg="white", font=("Arial", 10, "bold"), width=24).pack(pady=6)
+    tk.Button(root, text="Enable Auto-Start on Boot", command=setup_boot, bg="#2e7d32", fg="white", font=("Arial", 9, "bold"), width=24).pack(pady=4)
+    tk.Label(root, text="Received Files -> Desktop\\Remote_Received", font=("Arial", 8), fg="gray").pack(pady=8)
 
     root.mainloop()
 
 if __name__ == "__main__":
     threading.Thread(target=start_async_loop, daemon=True).start()
     start_gui()
-    
