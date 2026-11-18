@@ -2,27 +2,42 @@ import asyncio
 import base64
 import io
 import json
-import socket
+import os
+import random
+import string
 import threading
 import tkinter as tk
+from tkinter import messagebox
 import mss
 import pyautogui
+import websockets
 from PIL import Image
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-import uvicorn
 
-app = FastAPI()
+RELAY_URL = "wss://remote-relay-server-v5am.onrender.com"
+CONFIG_FILE = "remote_config.json"
+
 pyautogui.FAILSAFE = False
 
-def get_local_ip():
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except Exception:
-        return "127.0.0.1"
+def load_or_create_config():
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, "r") as f:
+            return json.load(f)
+    config = {
+        "id": "".join(random.choices(string.digits, k=9)),
+        "password": "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
+    }
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(config, f)
+    return config
+
+def save_config(host_id, password):
+    with open(CONFIG_FILE, "w") as f:
+        json.dump({"id": host_id, "password": password}, f)
+
+config = load_or_create_config()
+HOST_ID = config["id"]
+HOST_PASSWORD = config["password"]
+reconnect_flag = False
 
 def capture_screen():
     with mss.mss() as sct:
@@ -31,57 +46,86 @@ def capture_screen():
         img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
         img.thumbnail((1280, 720))
         buffer = io.BytesIO()
-        img.save(buffer, format="JPEG", quality=50)
+        img.save(buffer, format="JPEG", quality=45)
         return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
+async def connect_to_relay():
+    global reconnect_flag
     screen_w, screen_h = pyautogui.size()
 
-    async def send_screen():
+    while True:
+        reconnect_flag = False
+        uri = f"{RELAY_URL}/ws/host/{HOST_ID}/{HOST_PASSWORD}"
         try:
-            while True:
-                img_data = capture_screen()
-                await websocket.send_text(json.dumps({"type": "frame", "image": img_data}))
-                await asyncio.sleep(0.08)
+            async with websockets.connect(uri) as ws:
+                async def send_frames():
+                    while not reconnect_flag:
+                        img_data = capture_screen()
+                        await ws.send(json.dumps({"type": "frame", "image": img_data}))
+                        await asyncio.sleep(0.08)
+
+                async def receive_commands():
+                    async for message in ws:
+                        if reconnect_flag:
+                            break
+                        cmd = json.loads(message)
+                        action = cmd.get("type")
+                        if action in ["click", "right_click", "double_click"]:
+                            x = int(cmd["x"] * screen_w)
+                            y = int(cmd["y"] * screen_h)
+                            if action == "click":
+                                pyautogui.click(x, y)
+                            elif action == "right_click":
+                                pyautogui.rightClick(x, y)
+                            elif action == "double_click":
+                                pyautogui.doubleClick(x, y)
+                        elif action == "scroll":
+                            pyautogui.scroll(cmd["amount"])
+                        elif action == "type":
+                            pyautogui.write(cmd["text"])
+                        elif action == "key":
+                            pyautogui.press(cmd["key"])
+
+                await asyncio.gather(send_frames(), receive_commands())
         except Exception:
-            pass
+            await asyncio.sleep(2)
 
-    send_task = asyncio.create_task(send_screen())
+def start_async_loop():
+    asyncio.run(connect_to_relay())
 
-    try:
-        while True:
-            data = await websocket.receive_text()
-            command = json.loads(data)
-            if command["type"] == "click":
-                x = int(command["x"] * screen_w)
-                y = int(command["y"] * screen_h)
-                pyautogui.click(x, y)
-            elif command["type"] == "type":
-                pyautogui.write(command["text"])
-    except WebSocketDisconnect:
-        send_task.cancel()
-
-def run_server():
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="error")
-
-# சிறிய UI விண்டோ (IP முகவரியைக் காட்ட)
 def start_gui():
     root = tk.Tk()
-    root.title("Remote PC Host")
-    root.geometry("320x150")
+    root.title("My Remote PC Host")
+    root.geometry("360x260")
     root.resizable(False, False)
 
-    ip_address = get_local_ip()
-    tk.Label(root, text="Remote Desktop இயங்குகிறது", font=("Arial", 12, "bold"), fg="green").pack(pady=15)
-    tk.Label(root, text=f"உங்கள் IP முகவரி: {ip_address}:8000", font=("Arial", 11)).pack(pady=5)
-    tk.Label(root, text="(இந்த விண்டோவை மூடினால் இணைப்பு துண்டிக்கப்படும்)", font=("Arial", 8), fg="gray").pack(pady=10)
+    formatted_id = f"{HOST_ID[:3]} {HOST_ID[3:6]} {HOST_ID[6:]}"
+
+    tk.Label(root, text="உங்கள் கணினி இணையத்துடன் இணைக்கப்பட்டுள்ளது", font=("Arial", 10, "bold"), fg="green").pack(pady=10)
+    tk.Label(root, text="Your Permanent ID (நிரந்தர எண்):", font=("Arial", 10)).pack()
+    tk.Label(root, text=formatted_id, font=("Arial", 18, "bold"), fg="#0052cc").pack(pady=2)
+
+    tk.Label(root, text="Set Your Password (கடவுச்சொல் அமைக்கவும்):", font=("Arial", 10)).pack(pady=(10, 2))
+    pass_entry = tk.Entry(root, font=("Arial", 12), justify="center", width=20)
+    pass_entry.insert(0, HOST_PASSWORD)
+    pass_entry.pack(pady=5)
+
+    def update_password():
+        global HOST_PASSWORD, reconnect_flag
+        new_pass = pass_entry.get().strip()
+        if len(new_pass) < 4:
+            messagebox.showwarning("எச்சரிக்கை", "குறைந்தது 4 எழுத்துக்கள் கொண்ட பாஸ்வேர்டை உள்ளிடவும்!")
+            return
+        HOST_PASSWORD = new_pass
+        save_config(HOST_ID, HOST_PASSWORD)
+        reconnect_flag = True
+        messagebox.showinfo("வெற்றி", "புதிய பாஸ்வேர்டு சேமிக்கப்பட்டது!")
+
+    tk.Button(root, text="Save Password (சேமிக்கவும்)", command=update_password, bg="#0052cc", fg="white", font=("Arial", 10, "bold")).pack(pady=10)
 
     root.mainloop()
 
 if __name__ == "__main__":
-    server_thread = threading.Thread(target=run_server, daemon=True)
-    server_thread.start()
+    threading.Thread(target=start_async_loop, daemon=True).start()
     start_gui()
-  
+    
