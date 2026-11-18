@@ -4,7 +4,6 @@ import io
 import json
 import os
 import random
-import shutil
 import string
 import subprocess
 import sys
@@ -20,8 +19,11 @@ from PIL import Image, ImageDraw
 RELAY_URL = "wss://remote-relay-server-v5am.onrender.com"
 CONFIG_FILE = "remote_config.json"
 
+# மவுஸ் நகர்வில் எந்தத் தாமதமும் இல்லாமல் அதிவேகமாக இயங்க
 pyautogui.FAILSAFE = False
-SCREEN_QUALITY = 55
+pyautogui.PAUSE = 0
+
+SCREEN_QUALITY = 50
 SCREEN_WIDTH = 1280
 
 def load_or_create_config():
@@ -45,7 +47,6 @@ HOST_ID = config["id"]
 HOST_PASSWORD = config["password"]
 reconnect_flag = False
 
-# Windows ஆன் ஆகும்போது தானாகவே இயங்கச் செய்யும் வசதி
 def enable_autostart():
     try:
         startup_folder = os.path.join(
@@ -67,18 +68,20 @@ def capture_screen():
         sct_img = sct.grab(monitor)
         img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
 
-        # மவுஸ் கர்சர் இருக்கும் இடத்தைத் திரையில் தெளிவாக வரைதல்
+        # தெளிவான AnyDesk ஸ்டைல் மவுஸ் கர்சர்
         try:
             mx, my = pyautogui.position()
             rel_x = mx - monitor["left"]
             rel_y = my - monitor["top"]
             draw = ImageDraw.Draw(img)
-            draw.ellipse((rel_x - 14, rel_y - 14, rel_x + 14, rel_y + 14), outline="red", width=3)
             pointer = [
                 (rel_x, rel_y),
-                (rel_x, rel_y + 24),
-                (rel_x + 6, rel_y + 18),
-                (rel_x + 16, rel_y + 18),
+                (rel_x, rel_y + 22),
+                (rel_x + 5, rel_y + 17),
+                (rel_x + 10, rel_y + 26),
+                (rel_x + 13, rel_y + 24),
+                (rel_x + 8, rel_y + 15),
+                (rel_x + 15, rel_y + 15),
             ]
             draw.polygon(pointer, fill="white", outline="black")
         except Exception:
@@ -86,7 +89,7 @@ def capture_screen():
 
         ratio = SCREEN_WIDTH / float(img.size[0])
         new_height = int(float(img.size[1]) * ratio)
-        img = img.resize((SCREEN_WIDTH, new_height), Image.Resampling.LANCZOS)
+        img = img.resize((SCREEN_WIDTH, new_height), Image.Resampling.BILINEAR)
 
         buffer = io.BytesIO()
         img.save(buffer, format="JPEG", quality=SCREEN_QUALITY)
@@ -105,7 +108,7 @@ async def connect_to_relay():
                     while not reconnect_flag:
                         img_data = capture_screen()
                         await ws.send(json.dumps({"type": "frame", "image": img_data}))
-                        await asyncio.sleep(0.08)
+                        await asyncio.sleep(0.035)  # ~28 FPS அதிவேக ஸ்ட்ரீமிங்
 
                 async def receive_commands():
                     global SCREEN_QUALITY, SCREEN_WIDTH
@@ -115,28 +118,32 @@ async def connect_to_relay():
                         cmd = json.loads(message)
                         action = cmd.get("type")
 
-                        if action == "move":
+                        # AnyDesk போல விரல் நகரும் அளவிற்கு ஏற்ப ஸ்மூத்தாக நகரும் முறை
+                        if action == "move_rel":
+                            dx = int(cmd["dx"])
+                            dy = int(cmd["dy"])
+                            pyautogui.moveRel(dx, dy, _pause=False)
+
+                        elif action == "move":
                             x = int(cmd["x"] * screen_w)
                             y = int(cmd["y"] * screen_h)
-                            pyautogui.moveTo(x, y)
+                            pyautogui.moveTo(x, y, _pause=False)
 
                         elif action in ["click", "right_click", "double_click"]:
-                            if "x" in cmd and "y" in cmd:
-                                pyautogui.moveTo(int(cmd["x"] * screen_w), int(cmd["y"] * screen_h))
                             if action == "click":
-                                pyautogui.click()
+                                pyautogui.click(_pause=False)
                             elif action == "right_click":
-                                pyautogui.rightClick()
+                                pyautogui.rightClick(_pause=False)
                             elif action == "double_click":
-                                pyautogui.doubleClick()
+                                pyautogui.doubleClick(_pause=False)
 
                         elif action == "mouse_down":
-                            pyautogui.mouseDown()
+                            pyautogui.mouseDown(_pause=False)
                         elif action == "mouse_up":
-                            pyautogui.mouseUp()
+                            pyautogui.mouseUp(_pause=False)
 
                         elif action == "scroll":
-                            pyautogui.scroll(cmd["amount"])
+                            pyautogui.scroll(cmd["amount"], _pause=False)
 
                         elif action == "type":
                             pyautogui.write(cmd["text"])
@@ -149,24 +156,16 @@ async def connect_to_relay():
                             pyautogui.press(cmd["key"])
 
                         elif action == "hotkey":
-                            keys = cmd["keys"]
-                            pyautogui.hotkey(*keys)
+                            pyautogui.hotkey(*cmd["keys"])
 
                         elif action == "quality":
                             level = cmd["level"]
                             if level == "low":
                                 SCREEN_WIDTH, SCREEN_QUALITY = 854, 30
                             elif level == "medium":
-                                SCREEN_WIDTH, SCREEN_QUALITY = 1280, 55
+                                SCREEN_WIDTH, SCREEN_QUALITY = 1280, 50
                             elif level == "hd":
-                                SCREEN_WIDTH, SCREEN_QUALITY = 1600, 80
-
-                        elif action == "file_upload":
-                            save_dir = os.path.join(os.path.expanduser("~"), "Desktop", "Remote_Received")
-                            os.makedirs(save_dir, exist_ok=True)
-                            file_path = os.path.join(save_dir, cmd["filename"])
-                            with open(file_path, "wb") as f:
-                                f.write(base64.b64decode(cmd["data"]))
+                                SCREEN_WIDTH, SCREEN_QUALITY = 1600, 75
 
                         elif action == "power":
                             mode = cmd["mode"]
@@ -185,7 +184,7 @@ def start_async_loop():
 def start_gui():
     root = tk.Tk()
     root.title("My AnyDesk Pro - PC Host")
-    root.geometry("380x320")
+    root.geometry("380x310")
     root.resizable(False, False)
 
     formatted_id = f"{HOST_ID[:3]} {HOST_ID[3:6]} {HOST_ID[6:]}"
@@ -218,10 +217,10 @@ def start_gui():
 
     tk.Button(root, text="Save Password (சேமிக்கவும்)", command=update_password, bg="#0052cc", fg="white", font=("Arial", 10, "bold"), width=24).pack(pady=6)
     tk.Button(root, text="Enable Auto-Start on Boot", command=setup_boot, bg="#2e7d32", fg="white", font=("Arial", 9, "bold"), width=24).pack(pady=4)
-    tk.Label(root, text="Received Files -> Desktop\\Remote_Received", font=("Arial", 8), fg="gray").pack(pady=8)
 
     root.mainloop()
 
 if __name__ == "__main__":
     threading.Thread(target=start_async_loop, daemon=True).start()
     start_gui()
+    
