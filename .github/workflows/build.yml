@@ -18,7 +18,7 @@ jobs:
           
       - name: Install dependencies
         run: |
-          pip install pyinstaller fastapi uvicorn websockets mss pillow pyautogui
+          pip install pyinstaller fastapi uvicorn websockets mss pillow pyautogui pyperclip
           
       - name: Build EXE
         run: |
